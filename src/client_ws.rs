@@ -9,17 +9,25 @@
  * except according to those terms.
  */
 
-use std::{pin::Pin, sync::Arc};
+use std::{mem, pin::Pin, sync::Arc};
 
 use ahash::AHashMap;
-use futures_util::{stream::SplitSink, SinkExt, Stream, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, Stream, StreamExt,
+};
+use parking_lot::Mutex;
 use reqwest::header::SEC_WEBSOCKET_PROTOCOL;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     ClientConfig, SignatureScheme,
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     Connector, MaybeTlsStream, WebSocketStream,
@@ -34,6 +42,10 @@ use crate::{
     },
     DataType, Method, PushObject, URI,
 };
+
+type PendingResponse = oneshot::Sender<crate::Result<Response<TaggedMethodResponse>>>;
+type PendingResponses = Arc<Mutex<AHashMap<String, PendingResponse>>>;
+const PUSH_CHANNEL_BUFFER: usize = 64;
 
 #[derive(Debug, Serialize)]
 struct WebSocketRequest {
@@ -157,7 +169,20 @@ pub enum WebSocketMessage {
 
 pub struct WsStream {
     tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    req_id: usize,
+    req_id: u64,
+}
+
+struct CorrelatedWsTx {
+    tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    req_id: u64,
+}
+
+pub struct CorrelatedWs<'x> {
+    client: &'x Client,
+    tx: tokio::sync::Mutex<CorrelatedWsTx>,
+    pending: PendingResponses,
+    push_rx: tokio::sync::Mutex<mpsc::Receiver<crate::Result<PushObject>>>,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 #[doc(hidden)]
@@ -213,10 +238,219 @@ impl ServerCertVerifier for DummyVerifier {
     }
 }
 
-impl Client {
-    pub async fn connect_ws(
+impl WsStream {
+    fn new(tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>) -> Self {
+        Self { tx, req_id: 0 }
+    }
+
+    fn next_request_id(&mut self) -> crate::Result<String> {
+        next_request_id(&mut self.req_id, None)
+    }
+}
+
+impl CorrelatedWsTx {
+    fn new(tx: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>) -> Self {
+        Self { tx, req_id: 0 }
+    }
+
+    fn next_request_id(&mut self, pending: &PendingResponses) -> crate::Result<String> {
+        next_request_id(&mut self.req_id, Some(pending))
+    }
+}
+
+impl CorrelatedWs<'_> {
+    pub async fn send(
         &self,
-    ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>>>>> {
+        request: Request<'_>,
+    ) -> crate::Result<Response<TaggedMethodResponse>> {
+        if !request.is_built_by(self.client) {
+            return Err(crate::Error::Internal(
+                "Request was built by a different Client than this websocket connection."
+                    .to_string(),
+            ));
+        }
+
+        let (request_id, response) = {
+            let mut tx = self.tx.lock().await;
+            let request_id = tx.next_request_id(&self.pending)?;
+
+            let (response_tx, response_rx) = oneshot::channel();
+            self.pending.lock().insert(request_id.clone(), response_tx);
+
+            if let Err(err) = tx
+                .tx
+                .send(serialize_ws_message(&WebSocketRequest {
+                    _type: WebSocketRequestType::Request,
+                    id: request_id.clone().into(),
+                    using: request.using,
+                    method_calls: request.method_calls,
+                    created_ids: request.created_ids,
+                })?)
+                .await
+            {
+                self.pending.lock().remove(&request_id);
+                return Err(err.into());
+            }
+
+            (request_id, response_rx)
+        };
+
+        match timeout(self.client.timeout(), response).await {
+            Ok(Ok(response)) => {
+                let response = response?;
+                self.client.update_session_state(response.session_state());
+                Ok(response)
+            }
+            Err(_) => {
+                self.pending.lock().remove(&request_id);
+                Err(crate::Error::Internal(format!(
+                    "WebSocket response timed out after {:?}.",
+                    self.client.timeout()
+                )))
+            }
+            Ok(Err(_)) => {
+                self.pending.lock().remove(&request_id);
+                Err(crate::Error::Internal(
+                    "WebSocket response channel closed.".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub async fn next_push(&self) -> Option<crate::Result<PushObject>> {
+        self.push_rx.lock().await.recv().await
+    }
+
+    pub async fn enable_push_ws(
+        &self,
+        data_types: Option<impl IntoIterator<Item = DataType>>,
+        push_state: Option<impl Into<String>>,
+    ) -> crate::Result<()> {
+        self.tx
+            .lock()
+            .await
+            .tx
+            .send(serialize_ws_message(&WebSocketPushEnable {
+                _type: WebSocketPushEnableType::WebSocketPushEnable,
+                data_types: data_types.map(|it| it.into_iter().collect()),
+                push_state: push_state.map(|it| it.into()),
+            })?)
+            .await
+            .map_err(|err| err.into())
+    }
+
+    pub async fn disable_push_ws(&self) -> crate::Result<()> {
+        self.tx
+            .lock()
+            .await
+            .tx
+            .send(serialize_ws_message(&WebSocketPushDisable {
+                _type: WebSocketPushDisableType::WebSocketPushDisable,
+            })?)
+            .await
+            .map_err(|err| err.into())
+    }
+
+    pub async fn ws_ping(&self) -> crate::Result<()> {
+        self.tx
+            .lock()
+            .await
+            .tx
+            .send(Message::Ping(vec![].into()))
+            .await
+            .map_err(|err| err.into())
+    }
+}
+
+impl Drop for CorrelatedWs<'_> {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.lock().take() {
+            let _ = shutdown.send(());
+        }
+
+        fail_pending_responses(&self.pending, "WebSocket connection dropped.".to_string());
+    }
+}
+
+fn next_request_id(req_id: &mut u64, pending: Option<&PendingResponses>) -> crate::Result<String> {
+    let request_id = *req_id;
+    *req_id = req_id
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Internal("WebSocket request id overflow.".to_string()))?;
+
+    let request_id = request_id.to_string();
+    if matches!(pending, Some(pending) if pending.lock().contains_key(&request_id)) {
+        return Err(crate::Error::Internal(format!(
+            "WebSocket request id collision for requestId {request_id}."
+        )));
+    }
+
+    Ok(request_id)
+}
+
+fn into_response(response: WebSocketResponse) -> Response<TaggedMethodResponse> {
+    Response::new(
+        response.method_responses,
+        response.created_ids,
+        response.session_state,
+        response.request_id,
+    )
+}
+
+fn parse_ws_message(message: Message) -> Option<crate::Result<WebSocketMessage_>> {
+    if message.is_text() {
+        Some(serde_json::from_slice::<WebSocketMessage_>(&message.into_data()).map_err(Into::into))
+    } else {
+        None
+    }
+}
+
+fn serialize_ws_message(message: &impl Serialize) -> crate::Result<Message> {
+    Ok(Message::text(serde_json::to_string(message)?))
+}
+
+fn resolve_ws_response(
+    pending: &PendingResponses,
+    response: WebSocketResponse,
+) -> crate::Result<()> {
+    let request_id = response.request_id.clone().ok_or_else(|| {
+        crate::Error::Internal("WebSocket response missing requestId.".to_string())
+    })?;
+
+    if let Some(tx) = pending.lock().remove(&request_id) {
+        let _ = tx.send(Ok(into_response(response)));
+    }
+
+    Ok(())
+}
+
+fn resolve_ws_error(pending: &PendingResponses, error: WebSocketError) -> crate::Result<()> {
+    let request_id = error
+        .request_id
+        .clone()
+        .ok_or_else(|| crate::Error::Internal("WebSocket error missing requestId.".to_string()))?;
+
+    if let Some(tx) = pending.lock().remove(&request_id) {
+        let _ = tx.send(Err(ProblemDetails::from(error).into()));
+    }
+
+    Ok(())
+}
+
+fn fail_pending_responses(pending: &PendingResponses, message: impl Into<String>) {
+    let message = message.into();
+    for (_, tx) in mem::take(&mut *pending.lock()) {
+        let _ = tx.send(Err(crate::Error::Internal(message.clone())));
+    }
+}
+
+impl Client {
+    async fn open_ws(
+        &self,
+    ) -> crate::Result<(
+        SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    )> {
         let session = self.session();
         let capabilities = session.websocket_capabilities().ok_or_else(|| {
             crate::Error::Internal(
@@ -249,37 +483,108 @@ impl Client {
         } else {
             tokio_tungstenite::connect_async(request).await?
         };
-        let (tx, mut rx) = stream.split();
 
-        *self.ws.lock().await = WsStream { tx, req_id: 0 }.into();
+        Ok(stream.split())
+    }
+
+    pub async fn connect_ws(
+        &self,
+    ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>>>>> {
+        let (tx, mut rx) = self.open_ws().await?;
+
+        *self.ws.lock().await = Some(WsStream::new(tx));
 
         Ok(Box::pin(async_stream::stream! {
             while let Some(message) = rx.next().await {
                 match message {
-                    Ok(message) if message.is_text() => {
-                        match serde_json::from_slice::<WebSocketMessage_>(&message.into_data()) {
-                            Ok(message) => match message {
-                                WebSocketMessage_::Response(response) => {
-                                    yield Ok(WebSocketMessage::Response(Response::new(
-                                        response.method_responses,
-                                        response.created_ids,
-                                        response.session_state,
-                                        response.request_id,
-                                    )))
+                    Ok(message) => {
+                        if let Some(message) = parse_ws_message(message) {
+                            match message {
+                                Ok(WebSocketMessage_::Response(response)) => {
+                                    yield Ok(WebSocketMessage::Response(into_response(response)))
                                 }
-                                WebSocketMessage_::PushNotification(push) => {
+                                Ok(WebSocketMessage_::PushNotification(push)) => {
                                     yield Ok(WebSocketMessage::PushNotification(push.push))
                                 }
-                                WebSocketMessage_::Error(err) => yield Err(ProblemDetails::from(err).into()),
-                            },
-                            Err(err) => yield Err(err.into()),
+                                Ok(WebSocketMessage_::Error(err)) => {
+                                    yield Err(ProblemDetails::from(err).into())
+                                }
+                                Err(err) => yield Err(err),
+                            }
                         }
                     }
-                    Ok(_) => (),
                     Err(err) => yield Err(err.into()),
                 }
             }
         }))
+    }
+
+    pub async fn connect_ws_correlated(&self) -> crate::Result<CorrelatedWs<'_>> {
+        let (tx, mut rx) = self.open_ws().await?;
+        let pending = Arc::new(Mutex::new(AHashMap::new()));
+        let (push_tx, push_rx) = mpsc::channel(PUSH_CHANNEL_BUFFER);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let pending_ = pending.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return,
+                    message = rx.next() => match message {
+                        Some(Ok(message)) => {
+                            if let Some(message) = parse_ws_message(message) {
+                                match message {
+                                    Ok(WebSocketMessage_::Response(response)) => {
+                                        if let Err(err) = resolve_ws_response(&pending_, response) {
+                                            fail_pending_responses(&pending_, err.to_string());
+                                            let _ = push_tx.send(Err(err)).await;
+                                            return;
+                                        }
+                                    }
+                                    Ok(WebSocketMessage_::PushNotification(push)) => {
+                                        if push_tx.send(Ok(push.push)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Ok(WebSocketMessage_::Error(err)) => {
+                                        if let Err(err) = resolve_ws_error(&pending_, err) {
+                                            fail_pending_responses(&pending_, err.to_string());
+                                            let _ = push_tx.send(Err(err)).await;
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        fail_pending_responses(&pending_, err.to_string());
+                                        let _ = push_tx.send(Err(err)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(err)) => {
+                            let err = crate::Error::from(err);
+                            fail_pending_responses(&pending_, err.to_string());
+                            let _ = push_tx.send(Err(err)).await;
+                            return;
+                        }
+                        None => {
+                            let message = "WebSocket stream closed.".to_string();
+                            fail_pending_responses(&pending_, message.clone());
+                            let _ = push_tx.send(Err(crate::Error::Internal(message))).await;
+                            return;
+                        }
+                    },
+                }
+            }
+        });
+
+        Ok(CorrelatedWs {
+            client: self,
+            tx: tokio::sync::Mutex::new(CorrelatedWsTx::new(tx)),
+            pending,
+            push_rx: tokio::sync::Mutex::new(push_rx),
+            shutdown: Mutex::new(Some(shutdown_tx)),
+        })
     }
 
     pub async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
@@ -288,21 +593,16 @@ impl Client {
             .as_mut()
             .ok_or_else(|| crate::Error::Internal("Websocket stream not set.".to_string()))?;
 
-        // Assign request id
-        let request_id = ws.req_id.to_string();
-        ws.req_id += 1;
+        let request_id = ws.next_request_id()?;
 
         ws.tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketRequest {
-                    _type: WebSocketRequestType::Request,
-                    id: request_id.clone().into(),
-                    using: request.using,
-                    method_calls: request.method_calls,
-                    created_ids: request.created_ids,
-                })
-                .unwrap_or_default(),
-            ))
+            .send(serialize_ws_message(&WebSocketRequest {
+                _type: WebSocketRequestType::Request,
+                id: request_id.clone().into(),
+                using: request.using,
+                method_calls: request.method_calls,
+                created_ids: request.created_ids,
+            })?)
             .await?;
 
         Ok(request_id)
@@ -319,14 +619,11 @@ impl Client {
             .as_mut()
             .ok_or_else(|| crate::Error::Internal("Websocket stream not set.".to_string()))?
             .tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketPushEnable {
-                    _type: WebSocketPushEnableType::WebSocketPushEnable,
-                    data_types: data_types.map(|it| it.into_iter().collect()),
-                    push_state: push_state.map(|it| it.into()),
-                })
-                .unwrap_or_default(),
-            ))
+            .send(serialize_ws_message(&WebSocketPushEnable {
+                _type: WebSocketPushEnableType::WebSocketPushEnable,
+                data_types: data_types.map(|it| it.into_iter().collect()),
+                push_state: push_state.map(|it| it.into()),
+            })?)
             .await
             .map_err(|err| err.into())
     }
@@ -338,12 +635,9 @@ impl Client {
             .as_mut()
             .ok_or_else(|| crate::Error::Internal("Websocket stream not set.".to_string()))?
             .tx
-            .send(Message::text(
-                serde_json::to_string(&WebSocketPushDisable {
-                    _type: WebSocketPushDisableType::WebSocketPushDisable,
-                })
-                .unwrap_or_default(),
-            ))
+            .send(serialize_ws_message(&WebSocketPushDisable {
+                _type: WebSocketPushDisableType::WebSocketPushDisable,
+            })?)
             .await
             .map_err(|err| err.into())
     }
@@ -372,4 +666,89 @@ impl From<WebSocketError> for ProblemDetails {
             problem.request_id,
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::FutureExt;
+
+    use super::*;
+
+    #[test]
+    fn websocket_responses_are_correlated_by_request_id() {
+        let pending = Arc::new(Mutex::new(AHashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().insert("42".to_string(), tx);
+
+        resolve_ws_response(
+            &pending,
+            WebSocketResponse {
+                _type: WebSocketResponseType::Response,
+                request_id: Some("42".to_string()),
+                method_responses: vec![],
+                created_ids: None,
+                session_state: "state".to_string(),
+            },
+        )
+        .unwrap();
+
+        let response = rx.now_or_never().unwrap().unwrap().unwrap();
+        assert_eq!(response.request_id(), Some("42"));
+        assert_eq!(response.session_state(), "state");
+    }
+
+    #[test]
+    fn websocket_errors_are_correlated_by_request_id() {
+        let pending = Arc::new(Mutex::new(AHashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().insert("7".to_string(), tx);
+
+        resolve_ws_error(
+            &pending,
+            WebSocketError {
+                type_: WebSocketErrorType::RequestError,
+                request_id: Some("7".to_string()),
+                p_type: ProblemType::Other("urn:test:error".to_string()),
+                status: Some(400),
+                title: Some("Bad request".to_string()),
+                detail: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+
+        let error = rx.now_or_never().unwrap().unwrap().unwrap_err();
+        match error {
+            crate::Error::Problem(problem) => {
+                assert_eq!(problem.request_id(), Some("7"));
+                assert_eq!(problem.status(), Some(400));
+            }
+            err => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn websocket_responses_without_request_id_fail_correlation() {
+        let pending = Arc::new(Mutex::new(AHashMap::new()));
+
+        let error = resolve_ws_response(
+            &pending,
+            WebSocketResponse {
+                _type: WebSocketResponseType::Response,
+                request_id: None,
+                method_responses: vec![],
+                created_ids: None,
+                session_state: "state".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        match error {
+            crate::Error::Internal(message) => {
+                assert!(message.contains("missing requestId"));
+            }
+            err => panic!("unexpected error: {err:?}"),
+        }
+    }
+
 }

@@ -489,6 +489,10 @@ impl<'x> Request<'x> {
         self
     }
 
+    pub(crate) fn is_built_by(&self, client: &Client) -> bool {
+        std::ptr::eq(self.client, client)
+    }
+
     #[maybe_async::maybe_async]
     pub async fn send(self) -> crate::Result<Response<TaggedMethodResponse>> {
         self.client.send(&self).await
@@ -497,6 +501,14 @@ impl<'x> Request<'x> {
     #[cfg(feature = "websockets")]
     pub async fn send_ws(self) -> crate::Result<String> {
         self.client.send_ws(self).await
+    }
+
+    #[cfg(feature = "websockets")]
+    pub async fn send_ws_with(
+        self,
+        ws: &crate::client_ws::CorrelatedWs<'_>,
+    ) -> crate::Result<Response<TaggedMethodResponse>> {
+        ws.send(self).await
     }
 
     #[maybe_async::maybe_async]
@@ -544,6 +556,7 @@ impl<'x> Request<'x> {
         }
     }
 }
+
 
 impl ResultReference {
     pub fn new(method: Method, call_id: usize, path: impl Into<String>) -> Self {
