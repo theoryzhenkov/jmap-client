@@ -308,6 +308,12 @@ impl Client {
         &self.headers
     }
 
+    pub(crate) fn update_session_state(&self, session_state: &str) {
+        if session_state != self.session.lock().state() {
+            self.session_updated.store(false, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn redirect_policy(&self) -> redirect::Policy {
         let trusted_hosts = self.trusted_hosts.clone();
         redirect::Policy::custom(move |attempt| {
@@ -352,9 +358,7 @@ impl Client {
             .await?,
         )?;
 
-        if response.session_state() != self.session.lock().state() {
-            self.session_updated.store(false, Ordering::Relaxed);
-        }
+        self.update_session_state(response.session_state());
 
         Ok(response)
     }
