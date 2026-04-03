@@ -177,8 +177,8 @@ struct CorrelatedWsTx {
     req_id: u64,
 }
 
-pub struct CorrelatedWs<'x> {
-    client: &'x Client,
+pub struct CorrelatedWs {
+    client: Arc<Client>,
     tx: tokio::sync::Mutex<CorrelatedWsTx>,
     pending: PendingResponses,
     push_rx: tokio::sync::Mutex<mpsc::Receiver<crate::Result<PushObject>>>,
@@ -258,12 +258,12 @@ impl CorrelatedWsTx {
     }
 }
 
-impl CorrelatedWs<'_> {
+impl CorrelatedWs {
     pub async fn send(
         &self,
         request: Request<'_>,
     ) -> crate::Result<Response<TaggedMethodResponse>> {
-        if !request.is_built_by(self.client) {
+        if !request.is_built_by(&self.client) {
             return Err(crate::Error::Internal(
                 "Request was built by a different Client than this websocket connection."
                     .to_string(),
@@ -362,7 +362,7 @@ impl CorrelatedWs<'_> {
     }
 }
 
-impl Drop for CorrelatedWs<'_> {
+impl Drop for CorrelatedWs {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.lock().take() {
             let _ = shutdown.send(());
@@ -519,7 +519,7 @@ impl Client {
         }))
     }
 
-    pub async fn connect_ws_correlated(&self) -> crate::Result<CorrelatedWs<'_>> {
+    pub async fn connect_ws_correlated(self: &Arc<Self>) -> crate::Result<CorrelatedWs> {
         let (tx, mut rx) = self.open_ws().await?;
         let pending = Arc::new(Mutex::new(AHashMap::new()));
         let (push_tx, push_rx) = mpsc::channel(PUSH_CHANNEL_BUFFER);
@@ -579,7 +579,7 @@ impl Client {
         });
 
         Ok(CorrelatedWs {
-            client: self,
+            client: self.clone(),
             tx: tokio::sync::Mutex::new(CorrelatedWsTx::new(tx)),
             pending,
             push_rx: tokio::sync::Mutex::new(push_rx),

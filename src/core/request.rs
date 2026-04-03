@@ -506,7 +506,7 @@ impl<'x> Request<'x> {
     #[cfg(feature = "websockets")]
     pub async fn send_ws_with(
         self,
-        ws: &crate::client_ws::CorrelatedWs<'_>,
+        ws: &crate::client_ws::CorrelatedWs,
     ) -> crate::Result<Response<TaggedMethodResponse>> {
         ws.send(self).await
     }

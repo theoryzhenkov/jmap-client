@@ -14,17 +14,21 @@
  */
 
 #[cfg(feature = "websockets")]
+use std::sync::Arc;
+#[cfg(feature = "websockets")]
 use jmap_client::{client::Client, core::set::SetObject, PushObject};
 
 // Make sure the "websockets" feature is enabled!
 #[cfg(feature = "websockets")]
 async fn websocket() {
     // Connect to the JMAP server using Basic authentication
-    let client = Client::new()
-        .credentials(("john@example.org", "secret"))
-        .connect("https://jmap.example.org")
-        .await
-        .unwrap();
+    let client = Arc::new(
+        Client::new()
+            .credentials(("john@example.org", "secret"))
+            .connect("https://jmap.example.org")
+            .await
+            .unwrap(),
+    );
 
     // Open a correlated websocket connection and receive push notifications.
     let ws = client.connect_ws_correlated().await.unwrap();
